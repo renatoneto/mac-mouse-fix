@@ -213,6 +213,14 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     if (CGEvent_IsWacomEvent(event))
         return event;
     
+    /// Filter out scroll events from unmanaged local devices while no device is attached
+    ///     [Oct 2026] `SwitchMaster.swift > toggleScrollTap()` now also enables the scrollTap while no device is attached. That's so we can process scroll events from a mouse that is attached to *another* computer and forwarded to this one (e.g. via Universal Control, Barrier, Synergy).
+    ///         Such forwarded events are posted by a userspace process (`kCGEventSourceUnixProcessID` is set) instead of coming from a local IOHIDDevice.
+    ///         To preserve the previous behavior for everything else (e.g. scroll-wheel events from local devices that the DeviceManager doesn't manage), we let all events through unaltered, which don't come from a userspace process, while no device is attached.
+    ///     Caveat: Untested. If the forwarding software posts its events at `kCGSessionEventTap`, then our tap (which sits at `kCGHIDEventTap`) won't see them at all.
+    if (![DeviceManager someDeviceHasScrollWheel] && CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == 0)
+        return event;
+    
     /// Get timestamp
     ///     Get timestamp here instead of _scrollQueue for accurate timing
     ///     @afterNoGCDTodo We found that the HIDEvent's timestamps are much more accurate.
@@ -245,7 +253,8 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         IOHIDDeviceRef sendingDev = CGEventGetSendingDevice(event);
         
         /// Debug
-        assert(sendingDev != NULL);
+        ///     [Oct 2026] sendingDev is expected to be NULL for events that are posted by a userspace process (e.g. scroll events forwarded from another computer via Universal Control). See `eventTapCallback()`.
+        assert(sendingDev != NULL || CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0);
         
         /// Print info on sendingDev
         if (sendingDev != NULL) {
