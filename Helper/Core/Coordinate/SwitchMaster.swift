@@ -556,7 +556,13 @@ import ReactiveSwift
             return
         }
         
-        if someDeviceHasScroll && (defaultModifiesScroll || currentModificationModifiesScroll) {
+        /// [Oct 2026] Also enable the scrollTap while no device is attached, if the default scroll config modifies scroll (e.g. reverse scroll direction).
+        ///     That way we can process scroll events from a mouse that is attached to *another* computer and forwarded to this one (e.g. via Universal Control, Barrier, Synergy) – Those events don't come from an attached device.
+        ///     `Scroll.m > eventTapCallback()` makes sure that – while no device is attached – we only process scroll events that were posted by a userspace process, and let everything else through unaltered.
+        ///     Note: We only consider `defaultModifiesScroll` here, not `currentModificationModifiesScroll`, since keyboard/button modifiers for scrolling still require an attached device (see `toggleKbModTap()` and `toggleBtnModProcessing()`)
+        let canProcessForwardedScroll = !someDeviceHasScroll && defaultModifiesScroll
+        
+        if (someDeviceHasScroll && (defaultModifiesScroll || currentModificationModifiesScroll)) || canProcessForwardedScroll {
             Scroll.startReceiving()
         } else {
             Scroll.stopReceiving()
