@@ -172,6 +172,43 @@ static MFReadWriteTracker _readWriteTracker;
 
 #pragma clang diagnostic pop
 
+static bool CGEvent_IsFromVirtualSender(CGEventRef event) {
+    
+    /// Determine if an event does *not* come from a physical IOHIDDevice
+    ///     [Oct 2026] Used to process scroll events from a mouse that is attached to another computer and forwarded to this one.
+    ///     Observations (macOS 26.6, Universal Control, regular scroll wheel mouse attached to the other Mac):
+    ///         The forwarded events arrive at `kCGHIDEventTap` as regular line-based scroll events (`kCGScrollWheelEventIsContinuous == 0`, no scrollPhase), with `kCGEventSourceUnixProcessID == 0`,
+    ///         and with a `kMFCGEventFieldSenderID` that doesn't correspond to any entry in the IORegistry (e.g. `0xbfaa108000041`). -> Universal Control seems to use a virtual sender that IOHIDManager can't see. That's also why the DeviceManager never 'attaches' it.
+    ///     Software like Barrier/Synergy instead posts events from a userspace process (`kCGEventSourceUnixProcessID != 0`, senderID 0). (Untested)
+    ///     Caching: Looking up the IORegistry on every scroll tick would be wasteful, so we cache the result per senderID. (Never invalidated – a senderID being reused by a different kind of sender seems very unlikely.)
+    
+    assertRunLoop(IOThread.runLoop);
+    
+    /// Posted by a userspace process
+    if (CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0) return true;
+    
+    /// Get senderID
+    int64_t senderFieldValue = CGEventGetIntegerValueField(event, (CGEventField)kMFCGEventFieldSenderID);
+    uint64_t senderID;
+    memcpy(&senderID, &senderFieldValue, sizeof(senderID));
+    if (senderID == 0) return true;
+    
+    /// Check cache
+    static NSMutableDictionary<NSNumber *, NSNumber *> *_cache = nil;
+    if (_cache == nil) _cache = [NSMutableDictionary dictionary];
+    NSNumber *cached = _cache[@(senderID)];
+    if (cached != nil) return cached.boolValue;
+    
+    /// Look up senderID in the IORegistry
+    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, IORegistryEntryIDMatching(senderID)); /// `IORegistryEntryIDMatching()` dict is consumed by `IOServiceGetMatchingService()`
+    bool result = (service == MACH_PORT_NULL);
+    if (service != MACH_PORT_NULL) IOObjectRelease(service);
+    
+    /// Store & return
+    _cache[@(senderID)] = @(result);
+    return result;
+}
+
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *userInfo) {
     
     assertRunLoop(IOThread.runLoop);
@@ -215,10 +252,9 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     
     /// Filter out scroll events from unmanaged local devices while no device is attached
     ///     [Oct 2026] `SwitchMaster.swift > toggleScrollTap()` now also enables the scrollTap while no device is attached. That's so we can process scroll events from a mouse that is attached to *another* computer and forwarded to this one (e.g. via Universal Control, Barrier, Synergy).
-    ///         Such forwarded events are posted by a userspace process (`kCGEventSourceUnixProcessID` is set) instead of coming from a local IOHIDDevice.
-    ///         To preserve the previous behavior for everything else (e.g. scroll-wheel events from local devices that the DeviceManager doesn't manage), we let all events through unaltered, which don't come from a userspace process, while no device is attached.
-    ///     Caveat: Untested. If the forwarding software posts its events at `kCGSessionEventTap`, then our tap (which sits at `kCGHIDEventTap`) won't see them at all.
-    if (![DeviceManager someDeviceHasScrollWheel] && CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == 0)
+    ///         Such forwarded events don't come from a physical IOHIDDevice. See `CGEvent_IsFromVirtualSender()`.
+    ///         To preserve the previous behavior for everything else (e.g. scroll-wheel events from local physical devices that the DeviceManager doesn't manage), we let all other events through unaltered while no device is attached.
+    if (![DeviceManager someDeviceHasScrollWheel] && !CGEvent_IsFromVirtualSender(event))
         return event;
     
     /// Get timestamp
@@ -253,8 +289,8 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         IOHIDDeviceRef sendingDev = CGEventGetSendingDevice(event);
         
         /// Debug
-        ///     [Oct 2026] sendingDev is expected to be NULL for events that are posted by a userspace process (e.g. scroll events forwarded from another computer via Universal Control). See `eventTapCallback()`.
-        assert(sendingDev != NULL || CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0);
+        ///     [Oct 2026] sendingDev is expected to be NULL for events from a virtual sender (e.g. scroll events forwarded from another computer via Universal Control). See `eventTapCallback()`.
+        assert(sendingDev != NULL || CGEvent_IsFromVirtualSender(event));
         
         /// Print info on sendingDev
         if (sendingDev != NULL) {
